@@ -100,7 +100,6 @@ fi
 
 TAG_NAME="$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')"
 
-# Pick asset by name pattern
 ASSET_NAME="$(echo "$RELEASE_JSON" | jq -r '.assets[].name' \
   | grep -E '^jkef-trading-bot_slim_.*\.tar\.gz$' \
   | head -n 1 || true)"
@@ -125,7 +124,6 @@ say "Download (via Asset-ID) …"
 TMPDIR="$(mktemp -d)"
 ARCHIVE="${TMPDIR}/${ASSET_NAME}"
 
-# IMPORTANT: Download private release asset via API assets endpoint
 ASSET_API="https://api.github.com/repos/${JKEF_GH_REPO}/releases/assets/${ASSET_ID}"
 
 curl -fL \
@@ -142,7 +140,7 @@ fi
 say "Entpacke nach ${INSTALL_DIR} …"
 run_root mkdir -p "$INSTALL_DIR"
 
-# clean target (optional)
+# Clean target dir
 run_root bash -c "find '$INSTALL_DIR' -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
 
 run_root tar -xzf "$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1
@@ -158,7 +156,12 @@ say "Starte Bot-Installer aus ${INSTALL_DIR}/install.sh …"
 say "Hinweis: Ab jetzt kommen die Abfragen für .env / config.json / Binance Keys etc."
 say ""
 
-run_root bash -c "set -a; . '$GH_ENV'; set +a; bash '${INSTALL_DIR}/install.sh'"
+# ============================================================
+# WICHTIGER FIX:
+# - innerer Installer MUSS über /dev/tty lesen/schreiben,
+#   sonst mischt sich stdin von curl|bash in read() und es knallt.
+# ============================================================
+run_root bash -c "set -a; . '$GH_ENV'; set +a; exec bash '${INSTALL_DIR}/install.sh' < /dev/tty > /dev/tty 2>&1"
 
 rm -rf "$TMPDIR"
 
