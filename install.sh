@@ -1,119 +1,191 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== JKEF Bootstrap Installer =="
+# ============================================================
+# JKEF Bootstrap Installer (public repo)
+# - asks for GitHub repo + token via /dev/tty (works with curl|bash)
+# - stores credentials in /etc/jkef-trading-bot/github.env (600)
+# - downloads latest release from private repo (assets)
+# - extracts to /opt/jkef-trading-bot
+# - runs /opt/jkef-trading-bot/install.sh (the real bot installer)
+# ============================================================
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "Fehlt: $1"; exit 1; }; }
-need curl
-need tar
-need grep
-need sed
-need find
-need mktemp
+APP_NAME="JKEF Bootstrap Installer"
+DEFAULT_REPO="jkef80/jkef-bot-updates"
 
+CFG_DIR="/etc/jkef-trading-bot"
+GH_ENV="${CFG_DIR}/github.env"
+INSTALL_DIR="/opt/jkef-trading-bot"
+
+# ---- helpers ----
+is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
+
+run_root() {
+  if is_root; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# Prefer /dev/tty for prompts when script is piped
 TTY="/dev/tty"
-if [ ! -r "$TTY" ] || [ ! -w "$TTY" ]; then
-  echo "Fehler: Kein Terminal (/dev/tty) verfügbar. Bitte direkt im Terminal ausführen."
-  exit 1
+if [ ! -e "$TTY" ]; then
+  TTY="/dev/stdin"
 fi
 
-# --- Ask for repo (from terminal, not stdin) ---
-read -rp "GitHub Updates-Repo [jkef80/jkef-bot-updates]: " JKEF_GH_REPO < "$TTY"
-JKEF_GH_REPO="${JKEF_GH_REPO:-jkef80/jkef-bot-updates}"
+say() { echo -e "$*" >"$TTY"; }
+die() { say "Fehler: $*"; exit 1; }
 
-# --- Ask for token (from terminal, hidden input) ---
-echo "" > "$TTY"
-echo "============================================================" > "$TTY"
-echo "Gib jetzt deinen GitHub Token ein (Eingabe bleibt unsichtbar)." > "$TTY"
-echo "WICHTIG: Danach ENTER drücken." > "$TTY"
-echo "============================================================" > "$TTY"
-read -rsp "Token: " JKEF_GH_TOKEN < "$TTY"
-echo "" > "$TTY"
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+}
+
+apt_install_if_missing() {
+  local pkg="$1" cmd="$2"
+  if ! need_cmd "$cmd"; then
+    say "Installiere Paket: $pkg …"
+    run_root apt-get update -y
+    run_root apt-get install -y "$pkg"
+  fi
+}
+
+# ---- start ----
+say "== ${APP_NAME} =="
+
+# Basic deps
+apt_install_if_missing "curl" "curl"
+apt_install_if_missing "jq" "jq"
+apt_install_if_missing "ca-certificates" "update-ca-certificates" || true
+apt_install_if_missing "tar" "tar"
+
+# Create config dir
+run_root mkdir -p "$CFG_DIR"
+run_root chmod 700 "$CFG_DIR"
+
+# Prompt repo
+say ""
+say "GitHub Updates-Repo [${DEFAULT_REPO}]: "
+read -r JKEF_GH_REPO <"$TTY" || true
+JKEF_GH_REPO="${JKEF_GH_REPO:-$DEFAULT_REPO}"
+
+# Prompt token (hidden) - MUST read from TTY
+say ""
+say "============================================================"
+say "Gib jetzt deinen GitHub Token ein (Eingabe bleibt unsichtbar)."
+say "WICHTIG: Danach ENTER drücken."
+say "============================================================"
+# read -s from tty:
+# shellcheck disable=SC2162
+read -rsp "Token: " JKEF_GH_TOKEN <"$TTY" || true
+echo "" >"$TTY"
 
 if [ -z "${JKEF_GH_TOKEN:-}" ]; then
-  echo "Kein Token eingegeben – Abbruch."
-  exit 1
+  die "Kein Token eingegeben – Abbruch."
 fi
 
-# --- Save token for later updates (system-wide secrets path) ---
-sudo mkdir -p /etc/jkef-trading-bot
-sudo bash -c "cat > /etc/jkef-trading-bot/github.env" <<EOF
+# Store token + repo
+# We store as KEY=VALUE lines, source-able.
+TMP="$(mktemp)"
+cat >"$TMP" <<EOF
+# JKEF GitHub access (private repo)
 JKEF_GH_REPO=${JKEF_GH_REPO}
 JKEF_GH_TOKEN=${JKEF_GH_TOKEN}
 EOF
-sudo chmod 600 /etc/jkef-trading-bot/github.env
 
-echo "GitHub-Zugang gespeichert: /etc/jkef-trading-bot/github.env (600)"
+run_root bash -c "cat '$TMP' > '$GH_ENV'"
+run_root chmod 600 "$GH_ENV"
+run_root chown root:root "$GH_ENV" || true
+rm -f "$TMP"
 
-# --- Get latest release JSON ---
+say "GitHub-Zugang gespeichert: ${GH_ENV} (600)"
+
+# Fetch latest release JSON
+say "Hole Latest Release von GitHub …"
 API_URL="https://api.github.com/repos/${JKEF_GH_REPO}/releases/latest"
 
-echo "Hole Latest Release von GitHub …"
-HTTP_CODE=$(curl -sS -o /tmp/jkef_release.json -w "%{http_code}" \
-  -H "Authorization: Bearer ${JKEF_GH_TOKEN}" \
+RELEASE_JSON="$(curl -sS \
+  -H "Authorization: token ${JKEF_GH_TOKEN}" \
   -H "Accept: application/vnd.github+json" \
-  "${API_URL}" || true)
+  "$API_URL" || true)"
 
-if [ "${HTTP_CODE}" != "200" ]; then
-  echo "Fehler: GitHub API HTTP ${HTTP_CODE} beim Abruf von releases/latest"
-  echo "Antwort:"
-  cat /tmp/jkef_release.json || true
-  echo
-  echo "Ursachen:"
-  echo "- Token falsch/abgelaufen"
-  echo "- Token hat keinen Zugriff auf das private Repo"
-  echo "- Repo-Name falsch: ${JKEF_GH_REPO}"
+# Handle auth / API errors
+if [ -z "$RELEASE_JSON" ]; then
+  die "Leere Antwort von GitHub API. (Token/Netzwerk?)"
+fi
+
+API_MSG="$(echo "$RELEASE_JSON" | jq -r '.message // empty' 2>/dev/null || true)"
+API_STATUS="$(echo "$RELEASE_JSON" | jq -r '.status // empty' 2>/dev/null || true)"
+
+if [ -n "$API_MSG" ]; then
+  say "Fehler: GitHub API Antwort:"
+  echo "$RELEASE_JSON" | jq . >"$TTY" || true
+  say ""
+  die "GitHub API Fehler${API_STATUS:+ (Status $API_STATUS)}: $API_MSG"
+fi
+
+# Find asset name in assets[].name
+ASSET_NAME="$(echo "$RELEASE_JSON" | jq -r '.assets[].name' | grep -E '^jkef-trading-bot_slim_.*\.tar\.gz$' | head -n 1 || true)"
+if [ -z "$ASSET_NAME" ]; then
+  say "Kein passendes Asset gefunden."
+  say "Erwartet: jkef-trading-bot_slim_*.tar.gz"
+  say "Assets im Release sind:"
+  echo "$RELEASE_JSON" | jq -r '.assets[].name' >"$TTY" || true
   exit 1
 fi
 
-# --- Find asset download URL (expects jkef-trading-bot_slim_*.tar.gz) ---
-ASSET_URL=$(grep -Eo '"browser_download_url":[^"]+"' /tmp/jkef_release.json \
-  | sed 's/"browser_download_url":"//;s/"$//' \
-  | grep -E 'jkef-trading-bot_slim_.*\.tar\.gz$' \
-  | head -n1 || true)
-
-if [ -z "${ASSET_URL}" ]; then
-  echo "Kein passendes Asset gefunden."
-  echo "Erwartet: jkef-trading-bot_slim_*.tar.gz"
-  echo "Assets im Release waren (Auszug):"
-  grep -Eo '"name":[^"]+"' /tmp/jkef_release.json | head -n 50 || true
-  exit 1
+ASSET_URL="$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="'"$ASSET_NAME"'") | .browser_download_url')"
+if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+  die "Konnte Download-URL für Asset nicht ermitteln."
 fi
 
-echo "Gefundenes Asset:"
-echo "  ${ASSET_URL}"
+TAG_NAME="$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')"
+say "Gefundenes Release: ${TAG_NAME:-<unbekannt>}"
+say "Gefundenes Asset:   ${ASSET_NAME}"
+say "Download …"
 
-# --- Download asset ---
-WORKDIR="$(mktemp -d /tmp/jkef-install.XXXXXX)"
-ARCHIVE="${WORKDIR}/bot.tar.gz"
+TMPDIR="$(mktemp -d)"
+ARCHIVE="${TMPDIR}/${ASSET_NAME}"
 
-echo "Lade Release herunter …"
 curl -fL \
-  -H "Authorization: Bearer ${JKEF_GH_TOKEN}" \
+  -H "Authorization: token ${JKEF_GH_TOKEN}" \
   -H "Accept: application/octet-stream" \
-  "${ASSET_URL}" \
-  -o "${ARCHIVE}"
+  -o "$ARCHIVE" \
+  "$ASSET_URL"
 
-# --- Extract ---
-echo "Entpacke Release …"
-tar -xzf "${ARCHIVE}" -C "${WORKDIR}"
-
-# --- Find inner install.sh ---
-INNER_INSTALL="$(find "${WORKDIR}" -maxdepth 4 -name install.sh -type f | head -n 1 || true)"
-if [ -z "${INNER_INSTALL}" ]; then
-  echo "Keine install.sh im Release-Archiv gefunden – Abbruch."
-  echo "Inhalt (Top-Level):"
-  find "${WORKDIR}" -maxdepth 2 -type f | head -n 50 || true
-  exit 1
+if [ ! -s "$ARCHIVE" ]; then
+  rm -rf "$TMPDIR"
+  die "Download fehlgeschlagen oder Datei ist leer."
 fi
 
-chmod +x "${INNER_INSTALL}"
+# Extract to /opt/jkef-trading-bot
+say "Entpacke nach ${INSTALL_DIR} …"
+run_root mkdir -p "$INSTALL_DIR"
 
-echo "Starte Bot-Installation aus Release:"
-echo "  ${INNER_INSTALL}"
+# Clean target dir but keep it present (optional: comment out if you want preserve)
+run_root bash -c "find '$INSTALL_DIR' -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
 
-# Pass repo/token to inner install for updates
-export JKEF_GH_REPO
-export JKEF_GH_TOKEN
+run_root tar -xzf "$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1
 
-exec sudo -E bash "${INNER_INSTALL}"
+# Ensure bot installer exists
+if [ ! -f "${INSTALL_DIR}/install.sh" ]; then
+  rm -rf "$TMPDIR"
+  die "Im Paket fehlt ${INSTALL_DIR}/install.sh – das Release ist nicht installierbar."
+fi
+
+run_root chmod +x "${INSTALL_DIR}/install.sh" || true
+
+# Run the real installer from the package
+say "Starte Bot-Installer aus ${INSTALL_DIR}/install.sh …"
+say "Hinweis: Ab jetzt kommen die Abfragen für .env / config.json / Binance Keys etc."
+say ""
+
+# Export GH env for the installer/updater if it wants it
+# (installer can read /etc/jkef-trading-bot/github.env anyway)
+run_root bash -c "set -a; . '$GH_ENV'; set +a; bash '${INSTALL_DIR}/install.sh'"
+
+rm -rf "$TMPDIR"
+
+say ""
+say "Fertig."
+say "Wenn der Service läuft: systemctl status jkef-trading-bot"
