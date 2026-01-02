@@ -4,6 +4,10 @@ set -euo pipefail
 REPO_OWNER="jkef80"
 REPO_NAME="jkef-bot-updates"
 
+TARGET_DIR_NAME="jkef-trading-bot"   # so heißt der Ordner im Tar (bei dir so!)
+CACHE_DIR_NAME=".cache/jkef"
+LOG_FILE_NAME="jkef-install.log"
+
 die(){ echo "FEHLER: $*" >&2; exit 1; }
 log(){ echo "• $*"; }
 
@@ -14,7 +18,11 @@ RUN_USER="${SUDO_USER:-}"
 
 HOME_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 HOME_DIR="${HOME_DIR:-/home/$RUN_USER}"
-[[ -d "$HOME_DIR" ]] || die "Home-Verzeichnis nicht gefunden: $HOME_DIR"
+[[ -d "$HOME_DIR" ]] || die "Home nicht gefunden: $HOME_DIR"
+
+TARGET_DIR="${HOME_DIR}/${TARGET_DIR_NAME}"
+CACHE_DIR="${HOME_DIR}/${CACHE_DIR_NAME}"
+LOG_FILE="${HOME_DIR}/${LOG_FILE_NAME}"
 
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 if ! need_cmd curl || ! need_cmd jq || ! need_cmd tar; then
@@ -23,36 +31,26 @@ if ! need_cmd curl || ! need_cmd jq || ! need_cmd tar; then
   apt-get install -y curl jq tar
 fi
 
-STAMP="$(date +%Y%m%d_%H%M%S)"
-BASE_DIR="${HOME_DIR}/jkef-installer"
-WORK_DIR="${BASE_DIR}/work/${STAMP}"
-EXTRACT_DIR="${WORK_DIR}/extract"
-LOG_DIR="${BASE_DIR}/logs"
-LOG_FILE="${LOG_DIR}/install_${STAMP}.log"
-
-sudo -u "$RUN_USER" mkdir -p "$EXTRACT_DIR" "$LOG_DIR"
-sudo -u "$RUN_USER" chmod 700 "$BASE_DIR" "$WORK_DIR" 2>/dev/null || true
-
+# Alles in ein einziges Log (und trotzdem am Bildschirm)
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "== JKEF Installer =="
-echo "Repo      : ${REPO_OWNER}/${REPO_NAME}"
-echo "User      : ${RUN_USER}"
-echo "Home      : ${HOME_DIR}"
-echo "Work dir  : ${WORK_DIR}"
-echo "Log file  : ${LOG_FILE}"
+echo "== JKEF Simple Installer =="
+echo "User   : $RUN_USER"
+echo "Home   : $HOME_DIR"
+echo "Target : $TARGET_DIR"
+echo "Log    : $LOG_FILE"
 echo
 
+# Token via TTY
 echo "============================================================"
 echo "GitHub Token eingeben (Eingabe bleibt unsichtbar) und ENTER."
 echo "============================================================"
 read -rs -p "Token: " TOKEN < /dev/tty
 echo "" > /dev/tty
-
 TOKEN="$(printf "%s" "$TOKEN" | tr -d '\r\n')"
 [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
 
-# Auth Header (token vs Bearer)
+# Auth Header token vs Bearer
 auth_header=""
 code_token="$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token ${TOKEN}" https://api.github.com/user || true)"
 if [[ "$code_token" == "200" ]]; then
@@ -63,59 +61,46 @@ else
   auth_header="Authorization: Bearer ${TOKEN}"
 fi
 
-# Latest Release
+# Latest Release Asset
 API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 log "Hole latest release…"
 release_json="$(curl -fsSL -H "$auth_header" -H "Accept: application/vnd.github+json" "$API")"
-
-tag="$(echo "$release_json" | jq -r '.tag_name // empty')"
 asset_name="$(echo "$release_json" | jq -r '.assets[]?.name | select(endswith(".tar.gz"))' | head -n1)"
 asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url' | head -n1)"
 
 [[ -n "$asset_name" && -n "$asset_url" && "$asset_url" != "null" ]] || die "Kein .tar.gz Asset im Latest Release gefunden."
 
-log "Release tag: ${tag:-<ohne-tag>}"
-log "Asset      : $asset_name"
+log "Asset: $asset_name"
 
-TAR_PATH="${WORK_DIR}/${asset_name}"
+# Download nach ~/.cache/jkef/
+sudo -u "$RUN_USER" mkdir -p "$CACHE_DIR"
+TAR_PATH="${CACHE_DIR}/${asset_name}"
 
-# Download als USER nach /home/<user>/...
-log "Download (als ${RUN_USER}) nach: ${TAR_PATH}"
+log "Download -> $TAR_PATH (als $RUN_USER)"
 sudo -u "$RUN_USER" bash -lc \
   "curl -fL -H '$auth_header' -H 'Accept: application/octet-stream' '$asset_url' -o '$TAR_PATH'"
 
-# Extract als USER nach /home/<user>/...
-log "Entpacken (als ${RUN_USER}) nach: ${EXTRACT_DIR}"
-sudo -u "$RUN_USER" tar -xzf "$TAR_PATH" -C "$EXTRACT_DIR"
+# Zielordner ersetzen (deterministisch, KEIN Workdir)
+log "Ersetze Zielordner: $TARGET_DIR"
+rm -rf "$TARGET_DIR"
+sudo -u "$RUN_USER" mkdir -p "$TARGET_DIR"
 
-# --- SUPER EINFACH: Top-Level Ordner nehmen, dann install.sh ---
-top_dir="$(sudo -u "$RUN_USER" find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d -print | head -n 1 || true)"
+# Entpacken: Tar enthält bei dir den Ordner jkef-trading-bot/ oben drin.
+# Wir entpacken ins HOME und haben danach /home/user/jkef-trading-bot/...
+log "Entpacken ins HOME (als $RUN_USER)"
+sudo -u "$RUN_USER" bash -lc "cd '$HOME_DIR' && tar -xzf '$TAR_PATH'"
 
-install_path=""
-if [[ -n "$top_dir" && -f "$top_dir/install.sh" ]]; then
-  install_path="$top_dir/install.sh"
-else
-  # Fallback: falls tar anders ist, maxdepth 2 reicht in deinem Layout vollkommen
-  install_path="$(sudo -u "$RUN_USER" find "$EXTRACT_DIR" -maxdepth 2 -type f -name 'install.sh' -print -quit || true)"
-fi
+# Prüfen: install.sh muss existieren
+INSTALL_SH="${TARGET_DIR}/install.sh"
+[[ -f "$INSTALL_SH" ]] || die "install.sh nicht gefunden unter: $INSTALL_SH"
 
-[[ -n "$install_path" ]] || die "install.sh nicht gefunden im entpackten Paket."
+sudo -u "$RUN_USER" chmod +x "$INSTALL_SH" 2>/dev/null || true
 
-log "Gefunden install.sh: $install_path"
-sudo -u "$RUN_USER" chmod +x "$install_path" 2>/dev/null || true
-
-# install.sh aus dem TAR als root starten
-proj_dir="$(dirname "$install_path")"
-log "Starte TAR-install.sh als root aus: $proj_dir"
-cd "$proj_dir"
-
+log "Starte: $INSTALL_SH (als root)"
+cd "$TARGET_DIR"
 export INSTALL_USER="$RUN_USER"
 export INSTALL_HOME="$HOME_DIR"
-export JKEF_RELEASE_TAG="${tag:-}"
-
 bash "./install.sh"
 
 echo
 echo "== DONE =="
-echo "Work: ${WORK_DIR}"
-echo "Log : ${LOG_FILE}"
