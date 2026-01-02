@@ -3,14 +3,12 @@ set -euo pipefail
 
 REPO_OWNER="jkef80"
 REPO_NAME="jkef-bot-updates"
-TARGET_DIR="/opt/jkef-trading-bot"
+
 CONFIG_DIR="/etc/jkef-trading-bot"
 GITHUB_ENV="${CONFIG_DIR}/github.env"
 
-# Wer startet den Installer?
 ADMIN_USER="${SUDO_USER:-${USER}}"
 HOME_DIR="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
-DOWNLOAD_DIR="${HOME_DIR}"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -26,10 +24,10 @@ install_pkgs_if_missing() {
   fi
 }
 
-echo "== JKEF Bootstrap Installer (Minimal) =="
-echo "Repo: ${REPO_OWNER}/${REPO_NAME}"
-echo "User: ${ADMIN_USER}"
-echo "Home: ${HOME_DIR}"
+echo "== JKEF Bootstrap Installer (HOME-Extract Mode) =="
+echo "Repo : ${REPO_OWNER}/${REPO_NAME}"
+echo "User : ${ADMIN_USER}"
+echo "Home : ${HOME_DIR}"
 echo
 
 install_pkgs_if_missing
@@ -69,7 +67,7 @@ rc=$?
 set -e
 if [[ $rc -ne 0 || -z "$release_json" ]]; then
   echo "FEHLER: GitHub API nicht erreichbar oder Token ungültig (401/403)."
-  echo "Tipp: Token prüfen oder Datei löschen zum Neuabfragen:"
+  echo "Token reset:"
   echo "  sudo rm -f $GITHUB_ENV"
   exit 1
 fi
@@ -88,8 +86,8 @@ fi
 echo "Asset: $asset_name"
 
 # --- Download nach HOME ---
-mkdir -p "$DOWNLOAD_DIR"
-dest_tar="${DOWNLOAD_DIR}/${asset_name}"
+sudo -u "$ADMIN_USER" mkdir -p "$HOME_DIR"
+dest_tar="${HOME_DIR}/${asset_name}"
 
 echo "Download nach: $dest_tar"
 curl -fL \
@@ -100,58 +98,40 @@ curl -fL \
 
 echo "OK: Download fertig."
 
-# --- Entpacken in temp ---
-tmp="$(mktemp -d)"
-cleanup() { rm -rf "$tmp"; }
-trap cleanup EXIT
+# --- Entpacken im HOME in einen frischen Ordner ---
+stamp="$(date +%Y%m%d_%H%M%S)"
+extract_dir="${HOME_DIR}/jkef-release_${stamp}"
 
-echo "Entpacke nach Staging: $tmp/extract"
-mkdir -p "$tmp/extract"
-tar -xzf "$dest_tar" -C "$tmp/extract"
+echo "Entpacke nach: $extract_dir"
+sudo -u "$ADMIN_USER" mkdir -p "$extract_dir"
+sudo -u "$ADMIN_USER" tar -xzf "$dest_tar" -C "$extract_dir"
 
-# --- Projekt-Root finden: irgendwo install.sh im entpackten Baum ---
-proj=""
-cand="$(find "$tmp/extract" -maxdepth 4 -type f -name install.sh -print -quit || true)"
-if [[ -n "$cand" ]]; then
-  proj="$(dirname "$cand")"
-fi
-
-if [[ -z "$proj" ]]; then
-  echo "FEHLER: Im Paket keine install.sh gefunden."
-  echo "Top-Level Inhalt:"
-  ls -la "$tmp/extract" || true
+# --- Projekt-Root finden (wo install.sh liegt) ---
+cand="$(find "$extract_dir" -maxdepth 4 -type f -name install.sh -print -quit || true)"
+if [[ -z "$cand" ]]; then
+  echo "FEHLER: Im entpackten Paket keine install.sh gefunden."
+  echo "Inhalt (Top-Level):"
+  ls -la "$extract_dir" || true
   exit 1
 fi
 
-echo "Projektverzeichnis erkannt: $proj"
+proj="$(dirname "$cand")"
+echo "Projektverzeichnis: $proj"
 
-# --- Deploy nach /opt (ersetzen) ---
-echo "Deploy nach $TARGET_DIR (ersetze vorhandene Installation) …"
-sudo systemctl stop jkef-trading-bot >/dev/null 2>&1 || true
-
-sudo rm -rf "$TARGET_DIR"
-sudo mkdir -p "$TARGET_DIR"
-sudo cp -a "$proj/." "$TARGET_DIR/"
-
-# Eigentümer auf ADMIN_USER, damit UI/Updates später nicht an Rechten sterben
-sudo chown -R "${ADMIN_USER}:${ADMIN_USER}" "$TARGET_DIR"
-sudo find "$TARGET_DIR" -type d -exec chmod 755 {} \;
-sudo find "$TARGET_DIR" -type f -exec chmod 644 {} \;
-sudo chmod +x "$TARGET_DIR/install.sh" || true
-
-# --- Bot-Installer starten ---
-if [[ ! -f "$TARGET_DIR/install.sh" ]]; then
-  echo "FEHLER: Nach Deploy fehlt $TARGET_DIR/install.sh"
-  ls -la "$TARGET_DIR" || true
-  exit 1
-fi
-
+# --- install.sh im HOME starten (die kopiert dann selbst nach /opt/...) ---
 echo
-echo "Starte Bot-Installer: $TARGET_DIR/install.sh"
-cd "$TARGET_DIR"
+echo "Starte Bot-Installer aus HOME (macht Copy nach /opt selbst):"
+echo "  $cand"
+echo
+
+# sicherstellen, dass install.sh ausführbar ist
+sudo -u "$ADMIN_USER" chmod +x "$cand" || true
+
+# WICHTIG: als sudo starten, weil install.sh nach /opt und systemd schreibt
+cd "$proj"
 sudo bash ./install.sh
 
 echo
 echo "== DONE =="
-echo "Tar liegt unter: $dest_tar"
-echo "Installationspfad: $TARGET_DIR"
+echo "Tar:     $dest_tar"
+echo "Extract: $extract_dir"
