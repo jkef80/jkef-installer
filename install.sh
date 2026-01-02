@@ -11,13 +11,12 @@ set -euo pipefail
 REPO_OWNER="jkef80"
 REPO_NAME="jkef-bot-updates"
 
-# Optional: wenn dein Release-Asset immer gleich heißt, trage es ein.
+# Optional: Wenn dein Release-Asset immer gleich heißt, trage es ein.
 # Dann wird exakt dieses Asset genommen (falls vorhanden).
 PREFERRED_ASSET_NAME=""  # z.B. "jkef-bot-updates.tar.gz"
 
-# Debug: set to 1 for verbose bash
+# Debug: set DEBUG=1 to trace
 DEBUG="${DEBUG:-0}"
-
 if [[ "$DEBUG" == "1" ]]; then
   set -x
 fi
@@ -42,7 +41,6 @@ EXTRACT_DIR="${WORK_DIR}/extract"
 LOG_DIR="${BASE_DIR}/logs"
 LOG_FILE="${LOG_DIR}/install_${STAMP}.log"
 
-# Ensure deps
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 if ! need_cmd curl || ! need_cmd jq || ! need_cmd tar; then
   log "Installiere Pakete: curl jq tar …"
@@ -72,7 +70,7 @@ echo "============================================================"
 read -rs -p "Token: " TOKEN < /dev/tty
 echo "" > /dev/tty
 
-# trim
+# trim CR/LF/spaces
 TOKEN="$(printf "%s" "$TOKEN" | tr -d '\r\n')"
 TOKEN="${TOKEN#"${TOKEN%%[![:space:]]*}"}"
 TOKEN="${TOKEN%"${TOKEN##*[![:space:]]}"}"
@@ -107,4 +105,51 @@ asset_url=""
 
 if [[ -n "$PREFERRED_ASSET_NAME" ]]; then
   asset_name="$PREFERRED_ASSET_NAME"
-  asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url'_
+  asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url' | head -n1)"
+fi
+
+# fallback: first .tar.gz
+if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+  asset_name="$(echo "$release_json" | jq -r '.assets[]?.name | select(endswith(".tar.gz"))' | head -n1)"
+  asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url' | head -n1)"
+fi
+
+[[ -n "$asset_name" && -n "$asset_url" && "$asset_url" != "null" ]] || die "Kein .tar.gz Asset im Release gefunden."
+log "Asset: $asset_name"
+
+TAR_PATH="${WORK_DIR}/${asset_name}"
+
+# Download as RUN_USER into HOME workdir
+log "Download (als ${RUN_USER}) nach: ${TAR_PATH}"
+sudo -u "$RUN_USER" bash -lc \
+  "curl -fL -H '$auth_header' -H 'Accept: application/octet-stream' '$asset_url' -o '$TAR_PATH'"
+
+# Extract as RUN_USER
+log "Entpacken (als ${RUN_USER}) nach: ${EXTRACT_DIR}"
+sudo -u "$RUN_USER" tar -xzf "$TAR_PATH" -C "$EXTRACT_DIR"
+
+# Find install.sh inside extracted content (any depth)
+log "Suche install.sh im entpackten Paket…"
+install_path="$(sudo -u "$RUN_USER" find "$EXTRACT_DIR" -type f -name 'install.sh' -print 2>/dev/null | head -n 1 || true)"
+[[ -n "$install_path" ]] || die "Keine install.sh im Paket gefunden."
+
+log "Gefunden: $install_path"
+sudo -u "$RUN_USER" chmod +x "$install_path" 2>/dev/null || true
+
+# Run the extracted install.sh as root
+proj_dir="$(dirname "$install_path")"
+log "Starte install.sh als root aus: $proj_dir"
+cd "$proj_dir"
+
+export INSTALL_USER="$RUN_USER"
+export INSTALL_HOME="$HOME_DIR"
+export JKEF_WORK_DIR="$WORK_DIR"
+export JKEF_EXTRACT_DIR="$EXTRACT_DIR"
+export JKEF_RELEASE_TAG="${tag:-}"
+
+bash "./install.sh"
+
+echo
+echo "== DONE =="
+echo "Work: ${WORK_DIR}"
+echo "Log : ${LOG_FILE}"
