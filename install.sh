@@ -6,16 +6,22 @@ REPO_NAME="jkef-bot-updates"
 
 # Muss via: curl ... | sudo bash
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "FEHLER: Bitte so starten: curl -fsSL ... | sudo bash"
+  echo "FEHLER: Bitte so starten: curl -fsSL <URL> | sudo bash"
   exit 1
 fi
 
-# User bestimmen, dessen Home wir nutzen
-RUN_USER="${SUDO_USER:-admin}"
+# Ziel-User bestimmen (Home-User!)
+RUN_USER="${SUDO_USER:-}"
+if [[ -z "$RUN_USER" || "$RUN_USER" == "root" ]]; then
+  echo "FEHLER: Konnte keinen normalen Benutzer bestimmen (SUDO_USER fehlt)."
+  echo "Starte so: sudo -u <user> -i bash -c 'curl -fsSL <URL> | sudo bash'"
+  exit 1
+fi
+
 HOME_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 HOME_DIR="${HOME_DIR:-/home/$RUN_USER}"
 
-echo "== JKEF Bootstrap Installer =="
+echo "== JKEF Bootstrap Installer (Download+Extract im HOME, Install als root) =="
 echo "Repo : ${REPO_OWNER}/${REPO_NAME}"
 echo "User : ${RUN_USER}"
 echo "Home : ${HOME_DIR}"
@@ -34,6 +40,7 @@ echo "============================================================"
 read -rs -p "Token: " TOKEN < /dev/tty
 echo "" > /dev/tty
 
+# trim CR/LF/spaces
 TOKEN="$(printf "%s" "$TOKEN" | tr -d '\r\n')"
 TOKEN="${TOKEN#"${TOKEN%%[![:space:]]*}"}"
 TOKEN="${TOKEN%"${TOKEN##*[![:space:]]}"}"
@@ -54,9 +61,13 @@ else
   fi
 fi
 
+# Latest release holen
 API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 release_json="$(curl -fsSL -H "$auth_header" -H "Accept: application/vnd.github+json" "$API" 2>/dev/null || true)"
-[[ -n "$release_json" ]] || { echo "FEHLER: GitHub API nicht erreichbar/kein Zugriff."; exit 1; }
+[[ -n "$release_json" ]] || {
+  echo "FEHLER: GitHub API nicht erreichbar oder kein Repo-Zugriff (401/403/404)."
+  exit 1
+}
 
 tag="$(echo "$release_json" | jq -r '.tag_name // empty')"
 asset_name="$(echo "$release_json" | jq -r '.assets[]?.name | select(endswith(".tar.gz"))' | head -n1)"
@@ -71,17 +82,17 @@ echo "Release: ${tag:-<ohne-tag>}"
 echo "Asset  : ${asset_name}"
 echo
 
-# >>> WICHTIG: Immer nach /home/<user>/... (als RUN_USER) <<<
+# >>> WICHTIG: Alles nach /home/<user> und als RUN_USER <<<
 stamp="$(date +%Y%m%d_%H%M%S)"
-base="${HOME_DIR}/jkef_install/${stamp}"
+base="${HOME_DIR}/jkef_updates/${stamp}"
 tar_path="${base}/${asset_name}"
 extract_dir="${base}/extract"
 
-# Anlegen als RUN_USER
+echo "Arbeitsordner: $base"
 sudo -u "$RUN_USER" mkdir -p "$extract_dir"
-sudo -u "$RUN_USER" chmod -R 700 "${HOME_DIR}/jkef_install" || true
+sudo -u "$RUN_USER" chmod 700 "$base" || true
 
-echo "Download nach: $tar_path (als ${RUN_USER})"
+echo "Download als ${RUN_USER} nach: $tar_path"
 sudo -u "$RUN_USER" bash -lc \
   "curl -fL \
     -H '$auth_header' \
@@ -89,38 +100,43 @@ sudo -u "$RUN_USER" bash -lc \
     '$asset_url' \
     -o '$tar_path'"
 
-echo "Entpacke nach: $extract_dir (als ${RUN_USER})"
+echo "Entpacken als ${RUN_USER} nach: $extract_dir"
 sudo -u "$RUN_USER" tar -xzf "$tar_path" -C "$extract_dir"
 
-# install.sh finden (root oder 1 Ebene tiefer)
-proj=""
-if sudo -u "$RUN_USER" test -f "$extract_dir/install.sh"; then
-  proj="$extract_dir"
-else
-  cand="$(sudo -u "$RUN_USER" find "$extract_dir" -maxdepth 2 -type f -name install.sh -print -quit || true)"
-  [[ -n "$cand" ]] && proj="$(dirname "$cand")"
+# >>> install.sh robust im entpackten Paket finden (tiefer als 2!) <<<
+# Priorität: kürzester Pfad (meist die "richtige" install.sh im Root des Projekts)
+echo "Suche install.sh im entpackten Paket …"
+mapfile -t installs < <(sudo -u "$RUN_USER" find "$extract_dir" -type f -name "install.sh" -print 2>/dev/null || true)
+
+if [[ "${#installs[@]}" -eq 0 ]]; then
+  echo "FEHLER: Keine install.sh im entpackten Paket gefunden."
+  echo "Debug: oberste Ebene:"
+  sudo -u "$RUN_USER" find "$extract_dir" -maxdepth 3 -mindepth 1 -print | head -n 200 || true
+  exit 1
 fi
 
-[[ -n "$proj" ]] || {
-  echo "FEHLER: Im entpackten Paket wurde keine install.sh gefunden."
-  echo "Inhalt:"
-  sudo -u "$RUN_USER" ls -la "$extract_dir" || true
-  exit 1
-}
+# kürzesten Pfad wählen
+best="${installs[0]}"
+best_len=${#best}
+for f in "${installs[@]}"; do
+  if (( ${#f} < best_len )); then
+    best="$f"
+    best_len=${#f}
+  fi
+done
 
-echo
-echo "install.sh gefunden in: $proj/install.sh"
+proj_dir="$(dirname "$best")"
 
-# chmod als RUN_USER, damit es im Home sauber bleibt
-sudo -u "$RUN_USER" chmod +x "$proj/install.sh" || true
+echo "Gefunden: $best"
+sudo -u "$RUN_USER" chmod +x "$best" || true
 
-# >>> UND JETZT: install.sh als ROOT ausführen (das war dein Punkt) <<<
-echo "Starte install.sh als root (aber aus dem Home-Extract-Pfad)…"
-cd "$proj"
+# >>> Und JETZT: die install.sh aus dem Paket als ROOT starten <<<
+echo "Starte install.sh als root aus: $proj_dir"
+cd "$proj_dir"
 
-# ENV mitgeben (falls install.sh das auswerten will)
-INSTALL_USER="$RUN_USER" INSTALL_HOME="$HOME_DIR" bash ./install.sh
+# ENV mitgeben (falls deine install.sh das braucht)
+INSTALL_USER="$RUN_USER" INSTALL_HOME="$HOME_DIR" bash "./install.sh"
 
 echo
 echo "== DONE =="
-echo "Release liegt unter: $base"
+echo "Paket liegt unter: $base"
