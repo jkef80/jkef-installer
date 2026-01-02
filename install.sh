@@ -4,153 +4,154 @@ set -euo pipefail
 REPO_OWNER="jkef80"
 REPO_NAME="jkef-bot-updates"
 TARGET_DIR="/opt/jkef-trading-bot"
-ADMIN_USER="${SUDO_USER:-admin}"
+CONFIG_DIR="/etc/jkef-trading-bot"
+GITHUB_ENV="${CONFIG_DIR}/github.env"
 
-echo "== JKEF Bootstrap Installer (SIMPLE MODE) =="
+# Wer startet den Installer?
+ADMIN_USER="${SUDO_USER:-${USER}}"
+HOME_DIR="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
+DOWNLOAD_DIR="${HOME_DIR}"
 
-# --- deps ---
-need_cmd() { command -v "$1" >/dev/null 2>&1 || return 1; }
-install_pkg() { sudo apt-get update -y && sudo apt-get install -y "$@"; }
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-pkgs=()
-need_cmd curl || pkgs+=(curl)
-need_cmd jq   || pkgs+=(jq)
-need_cmd tar  || pkgs+=(tar)
-if ((${#pkgs[@]})); then
-  echo "Installiere Pakete: ${pkgs[*]} …"
-  install_pkg "${pkgs[@]}"
-fi
+install_pkgs_if_missing() {
+  local pkgs=()
+  need_cmd curl || pkgs+=(curl)
+  need_cmd jq   || pkgs+=(jq)
+  need_cmd tar  || pkgs+=(tar)
+  if ((${#pkgs[@]})); then
+    echo "Installiere Pakete: ${pkgs[*]} …"
+    sudo apt-get update -y
+    sudo apt-get install -y "${pkgs[@]}"
+  fi
+}
 
+echo "== JKEF Bootstrap Installer (Minimal) =="
+echo "Repo: ${REPO_OWNER}/${REPO_NAME}"
+echo "User: ${ADMIN_USER}"
+echo "Home: ${HOME_DIR}"
 echo
-echo "GitHub Updates-Repo [${REPO_OWNER}/${REPO_NAME}]"
-echo
 
-# --- token (works with curl|bash) ---
-GITHUB_ENV="/etc/jkef-trading-bot/github.env"
-TOKEN="${GITHUB_TOKEN:-}"
+install_pkgs_if_missing
 
-if [[ -z "${TOKEN}" && -f "$GITHUB_ENV" ]]; then
+# --- Token laden oder abfragen ---
+TOKEN=""
+if [[ -f "$GITHUB_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$GITHUB_ENV" || true
   TOKEN="${GITHUB_TOKEN:-}"
 fi
 
-prompt_token() {
-  # Always read from the real terminal so curl|bash works
-  if [[ ! -r /dev/tty ]]; then
-    echo "FEHLER: Kein TTY verfügbar um den GitHub Token abzufragen."
-    echo "Tipp: Setze GITHUB_TOKEN vorher als env oder lege $GITHUB_ENV an."
-    exit 1
-  fi
-
-  echo "============================================================" > /dev/tty
-  echo "Gib jetzt deinen GitHub Token ein (Eingabe bleibt unsichtbar)." > /dev/tty
-  echo "WICHTIG: Danach ENTER drücken." > /dev/tty
-  echo "============================================================" > /dev/tty
-  read -r -s TOKEN < /dev/tty
-  echo > /dev/tty
-
-  if [[ -z "${TOKEN}" ]]; then
-    echo "FEHLER: Leerer Token eingegeben." > /dev/tty
-    exit 1
-  fi
-
-  sudo mkdir -p /etc/jkef-trading-bot
+if [[ -z "${TOKEN}" ]]; then
+  echo "============================================================"
+  echo "Gib jetzt deinen GitHub Token ein (Eingabe bleibt unsichtbar)."
+  echo "WICHTIG: Danach ENTER drücken."
+  echo "============================================================"
+  read -r -s TOKEN
+  echo
+  sudo mkdir -p "$CONFIG_DIR"
   sudo bash -c "umask 077; cat > '$GITHUB_ENV' <<EOF
 GITHUB_TOKEN=$TOKEN
 EOF"
   echo "GitHub-Zugang gespeichert: $GITHUB_ENV (600)"
-}
-
-if [[ -z "${TOKEN}" ]]; then
-  prompt_token
 fi
 
-AUTH_HEADER="Authorization: token ${TOKEN}"
+AUTH_HEADER=("Authorization: token ${TOKEN}")
 
-# --- fetch latest release ---
+# --- Latest Release holen ---
+echo
 echo "Hole Latest Release von GitHub …"
 API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 
-release_json="$(curl -fsSL \
-  -H "$AUTH_HEADER" \
-  -H "Accept: application/vnd.github+json" \
-  "$API")"
+set +e
+release_json="$(curl -fsSL -H "${AUTH_HEADER[@]}" -H "Accept: application/vnd.github+json" "$API" 2>/dev/null)"
+rc=$?
+set -e
+if [[ $rc -ne 0 || -z "$release_json" ]]; then
+  echo "FEHLER: GitHub API nicht erreichbar oder Token ungültig (401/403)."
+  echo "Tipp: Token prüfen oder Datei löschen zum Neuabfragen:"
+  echo "  sudo rm -f $GITHUB_ENV"
+  exit 1
+fi
 
 tag="$(echo "$release_json" | jq -r '.tag_name // empty')"
 echo "Gefundenes Release: ${tag:-<ohne-tag>}"
 
 asset_name="$(echo "$release_json" | jq -r '.assets[]?.name | select(endswith(".tar.gz"))' | head -n1)"
-asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url' )"
+asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url')"
 
 if [[ -z "${asset_name}" || -z "${asset_url}" || "${asset_url}" == "null" ]]; then
   echo "FEHLER: Kein .tar.gz Asset im Latest Release gefunden."
   exit 1
 fi
 
-echo "Gefundenes Asset:   $asset_name"
+echo "Asset: $asset_name"
 
+# --- Download nach HOME ---
+mkdir -p "$DOWNLOAD_DIR"
+dest_tar="${DOWNLOAD_DIR}/${asset_name}"
+
+echo "Download nach: $dest_tar"
+curl -fL \
+  -H "${AUTH_HEADER[@]}" \
+  -H "Accept: application/octet-stream" \
+  "$asset_url" \
+  -o "$dest_tar"
+
+echo "OK: Download fertig."
+
+# --- Entpacken in temp ---
 tmp="$(mktemp -d)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
-echo "Download (via Asset API) …"
-curl -fL \
-  -H "$AUTH_HEADER" \
-  -H "Accept: application/octet-stream" \
-  "$asset_url" \
-  -o "$tmp/release.tar.gz"
-
-# --- extract ---
-echo "Entpacke in Staging …"
+echo "Entpacke nach Staging: $tmp/extract"
 mkdir -p "$tmp/extract"
-tar -xzf "$tmp/release.tar.gz" -C "$tmp/extract"
+tar -xzf "$dest_tar" -C "$tmp/extract"
 
-# --- find project root: either extract/*/install.sh OR extract/install.sh ---
+# --- Projekt-Root finden: irgendwo install.sh im entpackten Baum ---
 proj=""
-if [[ -f "$tmp/extract/install.sh" ]]; then
-  proj="$tmp/extract"
-else
-  cand="$(find "$tmp/extract" -maxdepth 2 -type f -name install.sh -print -quit || true)"
-  if [[ -n "$cand" ]]; then
-    proj="$(dirname "$cand")"
-  fi
+cand="$(find "$tmp/extract" -maxdepth 4 -type f -name install.sh -print -quit || true)"
+if [[ -n "$cand" ]]; then
+  proj="$(dirname "$cand")"
 fi
 
 if [[ -z "$proj" ]]; then
-  echo "FEHLER: Im Paket wurde keine install.sh gefunden."
+  echo "FEHLER: Im Paket keine install.sh gefunden."
   echo "Top-Level Inhalt:"
   ls -la "$tmp/extract" || true
   exit 1
 fi
 
-# --- sanity check: app/main.py must exist ---
-if [[ ! -f "$proj/app/main.py" ]]; then
-  echo "FEHLER: Source tree unvollständig (app/main.py fehlt)."
-  echo "Gefundenes Projektverzeichnis: $proj"
-  echo "Inhalt (Top-Level):"
-  ls -la "$proj" || true
-  exit 1
-fi
+echo "Projektverzeichnis erkannt: $proj"
 
-# --- deploy: delete & replace ---
-echo "Deploy nach $TARGET_DIR (ALLES ALT WIRD GELÖSCHT) …"
+# --- Deploy nach /opt (ersetzen) ---
+echo "Deploy nach $TARGET_DIR (ersetze vorhandene Installation) …"
 sudo systemctl stop jkef-trading-bot >/dev/null 2>&1 || true
 
 sudo rm -rf "$TARGET_DIR"
 sudo mkdir -p "$TARGET_DIR"
-
 sudo cp -a "$proj/." "$TARGET_DIR/"
 
-# ownership so web/local operations work
+# Eigentümer auf ADMIN_USER, damit UI/Updates später nicht an Rechten sterben
 sudo chown -R "${ADMIN_USER}:${ADMIN_USER}" "$TARGET_DIR"
 sudo find "$TARGET_DIR" -type d -exec chmod 755 {} \;
 sudo find "$TARGET_DIR" -type f -exec chmod 644 {} \;
 sudo chmod +x "$TARGET_DIR/install.sh" || true
 
-echo "Starte Bot-Installer aus $TARGET_DIR/install.sh …"
+# --- Bot-Installer starten ---
+if [[ ! -f "$TARGET_DIR/install.sh" ]]; then
+  echo "FEHLER: Nach Deploy fehlt $TARGET_DIR/install.sh"
+  ls -la "$TARGET_DIR" || true
+  exit 1
+fi
+
+echo
+echo "Starte Bot-Installer: $TARGET_DIR/install.sh"
 cd "$TARGET_DIR"
 sudo bash ./install.sh
 
 echo
-echo "== DONE (Bootstrap Simple) =="
+echo "== DONE =="
+echo "Tar liegt unter: $dest_tar"
+echo "Installationspfad: $TARGET_DIR"
