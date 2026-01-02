@@ -15,7 +15,7 @@ RUN_USER="${SUDO_USER:-admin}"
 HOME_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 HOME_DIR="${HOME_DIR:-/home/$RUN_USER}"
 
-echo "== JKEF Bootstrap Installer (HOME-Extract Mode) =="
+echo "== JKEF Bootstrap Installer (HOME-USER Download+Extract Mode) =="
 echo "Repo : ${REPO_OWNER}/${REPO_NAME}"
 echo "User : ${RUN_USER}"
 echo "Home : ${HOME_DIR}"
@@ -79,46 +79,47 @@ echo "Release: ${tag:-<ohne-tag>}"
 echo "Asset  : ${asset_name}"
 echo
 
-# Arbeitsordner in HOME
+# Arbeitsordner im HOME des RUN_USER (alles als RUN_USER!)
 stamp="$(date +%Y%m%d_%H%M%S)"
 base="${HOME_DIR}/jkef-release_${stamp}"
 tar_path="${base}/${asset_name}"
 extract_dir="${base}/extract"
 
-mkdir -p "$extract_dir"
-chown -R "${RUN_USER}:${RUN_USER}" "$base"
-chmod 700 "$base"
+# als RUN_USER anlegen, damit garantiert Home-Rechte passen
+sudo -u "$RUN_USER" mkdir -p "$extract_dir"
+sudo -u "$RUN_USER" chmod 700 "$base"
 
-echo "Download nach: $tar_path"
-curl -fL \
-  -H "$auth_header" \
-  -H "Accept: application/octet-stream" \
-  "$asset_url" \
-  -o "$tar_path"
-chown "${RUN_USER}:${RUN_USER}" "$tar_path"
+echo "Download nach: $tar_path (als ${RUN_USER})"
+# Download als RUN_USER (nicht als root)
+sudo -u "$RUN_USER" bash -lc \
+  "curl -fL \
+    -H '$auth_header' \
+    -H 'Accept: application/octet-stream' \
+    '$asset_url' \
+    -o '$tar_path'"
 
-echo "Entpacke nach: $extract_dir"
+echo "Entpacke nach: $extract_dir (als ${RUN_USER})"
 sudo -u "$RUN_USER" tar -xzf "$tar_path" -C "$extract_dir"
 
 # install.sh finden (root oder 1 Ebene tiefer)
 proj=""
-if [[ -f "$extract_dir/install.sh" ]]; then
+if sudo -u "$RUN_USER" test -f "$extract_dir/install.sh"; then
   proj="$extract_dir"
 else
-  cand="$(find "$extract_dir" -maxdepth 2 -type f -name install.sh -print -quit || true)"
+  cand="$(sudo -u "$RUN_USER" find "$extract_dir" -maxdepth 2 -type f -name install.sh -print -quit || true)"
   [[ -n "$cand" ]] && proj="$(dirname "$cand")"
 fi
 
 [[ -n "$proj" ]] || {
   echo "FEHLER: Im entpackten Paket wurde keine install.sh gefunden."
   echo "Inhalt:"
-  ls -la "$extract_dir" || true
+  sudo -u "$RUN_USER" ls -la "$extract_dir" || true
   exit 1
 }
 
 echo
 echo "Starte Bot-Installer aus: $proj/install.sh"
-chmod +x "$proj/install.sh" || true
+sudo -u "$RUN_USER" chmod +x "$proj/install.sh" || true
 
 # Wichtig: von dort starten – der Rest ist Aufgabe des Bot-install.sh
 cd "$proj"
