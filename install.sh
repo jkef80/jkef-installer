@@ -1,232 +1,137 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# == JKEF Bootstrap Installer ==
-# Lädt das Latest Release-Asset aus jkef-bot-updates und startet anschließend den Bot-Installer.
-# Robust gegen unterschiedliche TAR-Strukturen (mit/ohne Top-Level-Ordner, /opt/... Prefix etc.).
+REPO_OWNER="jkef80"
+REPO_NAME="jkef-bot-updates"
+TARGET_DIR="/opt/jkef-trading-bot"
+ADMIN_USER="${SUDO_USER:-admin}"
 
-REPO_DEFAULT="jkef80/jkef-bot-updates"
-INSTALL_DIR="/opt/jkef-trading-bot"
-GH_ENV="/etc/jkef-trading-bot/github.env"
+echo "== JKEF Bootstrap Installer (SIMPLE MODE) =="
 
-say() { printf "%s\n" "$*"; }
-err() { printf "ERROR: %s\n" "$*" >&2; }
-need() { command -v "$1" >/dev/null 2>&1 || { err "Missing dependency: $1"; exit 1; }; }
+# --- deps ---
+need_cmd() { command -v "$1" >/dev/null 2>&1 || return 1; }
+install_pkg() { sudo apt-get update -y && sudo apt-get install -y "$@"; }
 
-run_root() {
-  if [[ ${EUID:-0} -ne 0 ]]; then
-    sudo -n true 2>/dev/null || {
-      say ""; say "== sudo benötigt (Root-Rechte) =="; say "Bitte Passwort eingeben, falls gefragt."; say "";
-    }
-    sudo "$@"
-  else
-    "$@"
+pkgs=()
+need_cmd curl || pkgs+=(curl)
+need_cmd jq   || pkgs+=(jq)
+need_cmd tar  || pkgs+=(tar)
+if ((${#pkgs[@]})); then
+  echo "Installiere Pakete: ${pkgs[*]} …"
+  install_pkg "${pkgs[@]}"
+fi
+
+echo
+echo "GitHub Updates-Repo [${REPO_OWNER}/${REPO_NAME}]"
+echo
+
+# --- token (optional but recommended for private repos / rate limits) ---
+GITHUB_ENV="/etc/jkef-trading-bot/github.env"
+TOKEN=""
+
+if [[ -f "$GITHUB_ENV" ]]; then
+  # shellcheck disable=SC1090
+  source "$GITHUB_ENV" || true
+  TOKEN="${GITHUB_TOKEN:-}"
+fi
+
+if [[ -z "${TOKEN}" ]]; then
+  echo "============================================================"
+  echo "Gib jetzt deinen GitHub Token ein (Eingabe bleibt unsichtbar)."
+  echo "WICHTIG: Danach ENTER drücken."
+  echo "============================================================"
+  read -r -s TOKEN
+  echo
+  sudo mkdir -p /etc/jkef-trading-bot
+  sudo bash -c "umask 077; cat > '$GITHUB_ENV' <<EOF
+GITHUB_TOKEN=$TOKEN
+EOF"
+  echo "GitHub-Zugang gespeichert: $GITHUB_ENV (600)"
+fi
+
+AUTH_HEADER=("Authorization: token ${TOKEN}")
+
+# --- fetch latest release ---
+echo "Hole Latest Release von GitHub …"
+API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+release_json="$(curl -fsSL -H "${AUTH_HEADER[@]}" -H "Accept: application/vnd.github+json" "$API")"
+
+tag="$(echo "$release_json" | jq -r '.tag_name // empty')"
+echo "Gefundenes Release: ${tag:-<ohne-tag>}"
+
+asset_name="$(echo "$release_json" | jq -r '.assets[]?.name | select(endswith(".tar.gz"))' | head -n1)"
+asset_url="$(echo "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name==$n) | .url' )"
+
+if [[ -z "${asset_name}" || -z "${asset_url}" || "${asset_url}" == "null" ]]; then
+  echo "FEHLER: Kein .tar.gz Asset im Latest Release gefunden."
+  exit 1
+fi
+
+echo "Gefundenes Asset:   $asset_name"
+
+tmp="$(mktemp -d)"
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT
+
+echo "Download (via Asset API) …"
+curl -fL \
+  -H "${AUTH_HEADER[@]}" \
+  -H "Accept: application/octet-stream" \
+  "$asset_url" \
+  -o "$tmp/release.tar.gz"
+
+# --- extract ---
+echo "Entpacke in Staging …"
+mkdir -p "$tmp/extract"
+tar -xzf "$tmp/release.tar.gz" -C "$tmp/extract"
+
+# --- find project root: either extract/*/install.sh OR extract/install.sh ---
+proj=""
+if [[ -f "$tmp/extract/install.sh" ]]; then
+  proj="$tmp/extract"
+else
+  # one level deep
+  cand="$(find "$tmp/extract" -maxdepth 2 -type f -name install.sh -print -quit || true)"
+  if [[ -n "$cand" ]]; then
+    proj="$(dirname "$cand")"
   fi
-}
+fi
 
-invoker_user() {
-  # User, der das Script gestartet hat (nicht root)
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-    echo "${SUDO_USER}"
-  else
-    echo "${USER:-admin}"
-  fi
-}
+if [[ -z "$proj" ]]; then
+  echo "FEHLER: Im Paket wurde keine install.sh gefunden."
+  echo "Top-Level Inhalt:"
+  ls -la "$tmp/extract" || true
+  exit 1
+fi
 
-install_jq() {
-  if ! command -v jq >/dev/null 2>&1; then
-    say "Installiere Paket: jq …"
-    run_root apt-get update -y
-    run_root apt-get install -y jq
-  fi
-}
+# --- sanity check: app/main.py must exist (classic layout) ---
+if [[ ! -f "$proj/app/main.py" ]]; then
+  echo "FEHLER: Source tree unvollständig (app/main.py fehlt)."
+  echo "Gefundenes Projektverzeichnis: $proj"
+  echo "Inhalt (Top-Level):"
+  ls -la "$proj" || true
+  exit 1
+fi
 
-read_token() {
-  say ""; say "GitHub Updates-Repo [${REPO_DEFAULT}]:"; say ""
-  say ""; say "============================================================"
-  say "Gib jetzt deinen GitHub Token ein (Eingabe bleibt unsichtbar)."
-  say "WICHTIG: Danach ENTER drücken."
-  say "============================================================"
-  read -rs -p "Token: " GH_TOKEN < /dev/tty
-  echo "" > /dev/tty
+# --- deploy: delete & replace (as requested) ---
+echo "Deploy nach $TARGET_DIR (ALLES ALT WIRD GELÖSCHT) …"
+sudo systemctl stop jkef-trading-bot >/dev/null 2>&1 || true
 
-  if [[ -z "${GH_TOKEN}" ]]; then
-    err "Kein Token eingegeben."; exit 1
-  fi
+sudo rm -rf "$TARGET_DIR"
+sudo mkdir -p "$TARGET_DIR"
 
-  run_root mkdir -p "$(dirname "$GH_ENV")"
-  umask 077
-  run_root bash -c "cat > '$GH_ENV' <<EOF\nJKEF_GH_TOKEN='${GH_TOKEN}'\nJKEF_GH_REPO='${REPO_DEFAULT}'\nEOF"
-  run_root chmod 600 "$GH_ENV"
-  say "GitHub-Zugang gespeichert: $GH_ENV (600)"
-}
+# copy
+sudo cp -a "$proj/." "$TARGET_DIR/"
 
-api() {
-  local method="$1" url="$2"; shift 2
-  # shellcheck disable=SC2086
-  curl -fsSL -X "$method" \
-    -H "Accept: application/vnd.github+json" \
-    -H "Authorization: Bearer ${GH_TOKEN}" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "$url" "$@"
-}
+# ownership so web/local operations work
+sudo chown -R "${ADMIN_USER}:${ADMIN_USER}" "$TARGET_DIR"
+sudo find "$TARGET_DIR" -type d -exec chmod 755 {} \;
+sudo find "$TARGET_DIR" -type f -exec chmod 644 {} \;
+sudo chmod +x "$TARGET_DIR/install.sh" || true
 
-latest_release_json() {
-  api GET "https://api.github.com/repos/${REPO_DEFAULT}/releases/latest"
-}
+echo "Starte Bot-Installer aus $TARGET_DIR/install.sh …"
+cd "$TARGET_DIR"
+sudo bash ./install.sh
 
-pick_asset() {
-  local json="$1"
-  # bevorzugt: tar.gz mit jkef-trading-bot im Namen
-  local name
-  name=$(jq -r '.assets[] | select(.name|test("jkef-trading-bot")) | select(.name|endswith(".tar.gz")) | .name' <<<"$json" | head -n1 || true)
-  if [[ -z "$name" ]]; then
-    # fallback: erstes tar.gz
-    name=$(jq -r '.assets[] | select(.name|endswith(".tar.gz")) | .name' <<<"$json" | head -n1 || true)
-  fi
-  echo "$name"
-}
-
-asset_id_for_name() {
-  local json="$1" name="$2"
-  jq -r --arg NAME "$name" '.assets[] | select(.name==$NAME) | .id' <<<"$json"
-}
-
-download_asset() {
-  local asset_id="$1" out="$2"
-  # Asset-Download über API (redirects) -> setzt richtige Auth
-  api GET "https://api.github.com/repos/${REPO_DEFAULT}/releases/assets/${asset_id}" \
-    -H "Accept: application/octet-stream" \
-    -o "$out"
-}
-
-# Detect how many path components to strip when extracting.
-# - If archive paths start with "opt/jkef-trading-bot/" -> strip 2
-# - If they start with a single common top folder -> strip 1
-# - Else -> strip 0
-compute_strip_components() {
-  local tarfile="$1"
-  local paths
-  paths=$(tar -tzf "$tarfile" | head -n 200)
-  [[ -n "$paths" ]] || { echo 0; return; }
-
-  # If any path begins with opt/jkef-trading-bot/
-  if grep -qE '^opt/jkef-trading-bot/' <<<"$paths"; then
-    echo 2; return
-  fi
-
-  # Determine common first component
-  local first
-  first=$(awk -F/ 'NF{print $1}' <<<"$paths" | grep -v '^\.$' | sort -u | head -n2)
-  if [[ $(wc -l <<<"$first") -eq 1 ]]; then
-    # Exactly one unique top component
-    echo 1; return
-  fi
-
-  echo 0
-}
-
-safe_deploy_tree() {
-  local tarfile="$1" target="$2" owner="$3"
-  local tmp
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
-
-  local strip
-  strip=$(compute_strip_components "$tarfile")
-
-  say "Entpacke (strip-components=$strip) nach Staging …"
-  tar -xzf "$tarfile" -C "$tmp" --strip-components="$strip"
-
-  # Sanity: muss install.sh enthalten
-  if [[ ! -f "$tmp/install.sh" ]]; then
-    err "Im Paket fehlt install.sh (nach Entpacken)."
-    err "TAR-Top-Level (debug):"
-    tar -tzf "$tarfile" | head -n 30 >&2
-    exit 1
-  fi
-
-  # Zusätzliche Sanity: app/main.py ist Pflicht (sonst Installation abbrechen, damit /opt nicht leer/kaputt wird)
-  if [[ ! -f "$tmp/app/main.py" ]]; then
-    err "Source tree ist unvollständig (./app/main.py fehlt)."
-    err "Abbruch, um ein Löschen der Installation zu verhindern."
-    err "Enthaltene Dateien (Top-Level):"
-    (cd "$tmp" && ls -la) >&2
-    exit 1
-  fi
-
-  say "Deploy nach $target …"
-  run_root mkdir -p "$target"
-  run_root rsync -a --delete \
-    --exclude='.env' \
-    --exclude='config.json' \
-    --exclude='data/' \
-    "$tmp/" "$target/"
-
-  # Ownership so setzen, dass der Invoker/Service-User schreiben kann (venv!)
-  run_root chown -R "$owner:$owner" "$target"
-  run_root find "$target" -type d -exec chmod 755 {} +
-  run_root find "$target" -type f -exec chmod 644 {} +
-  run_root chmod +x "$target/install.sh" || true
-}
-
-main() {
-  say "== JKEF Bootstrap Installer =="
-  install_jq
-  need curl
-  need tar
-  need rsync
-
-  local owner
-  owner=$(invoker_user)
-
-  if [[ ! -f "$GH_ENV" ]]; then
-    read_token
-  else
-    # load token
-    # shellcheck disable=SC1090
-    source "$GH_ENV"
-    GH_TOKEN="${JKEF_GH_TOKEN:-}"
-    if [[ -z "${GH_TOKEN}" ]]; then
-      read_token
-    else
-      say "GitHub-Zugang geladen: $GH_ENV"
-    fi
-  fi
-
-  say "Hole Latest Release von GitHub …"
-  local json
-  json=$(latest_release_json)
-  local tag
-  tag=$(jq -r '.tag_name // ""' <<<"$json")
-  local asset
-  asset=$(pick_asset "$json")
-  if [[ -z "$asset" ]]; then
-    err "Kein .tar.gz Asset im Latest Release gefunden."; exit 1
-  fi
-  say "Gefundenes Release: ${tag}"
-  say "Gefundenes Asset:   ${asset}"
-
-  local id
-  id=$(asset_id_for_name "$json" "$asset")
-  if [[ -z "$id" || "$id" == "null" ]]; then
-    err "Konnte Asset-ID nicht ermitteln."; exit 1
-  fi
-
-  local dl
-  dl=$(mktemp)
-  trap 'rm -f "$dl"' EXIT
-
-  say "Download (via Asset-ID) …"
-  download_asset "$id" "$dl"
-
-  safe_deploy_tree "$dl" "$INSTALL_DIR" "$owner"
-
-  say "Starte Bot-Installer aus $INSTALL_DIR/install.sh …"
-  say "Hinweis: Ab jetzt kommen die Abfragen für .env / config.json / Binance Keys etc."
-
-  # Bot-Installer als normaler User ausführen (root nur über sudo IN install.sh)
-  run_root bash -c "set -a; source '$GH_ENV'; set +a; exec sudo -u '$owner' -H bash '$INSTALL_DIR/install.sh' < /dev/tty > /dev/tty 2>&1"
-}
-
-main "$@"
+echo
+echo "== DONE (Bootstrap Simple) =="
