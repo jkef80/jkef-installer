@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ------------------------------------------------------------
+# JKEF Bootstrap Installer (Putty-safe + curl|sudo bash safe)
+# - Menu via /dev/tty (u/i/e), no arrow keys
+# - Detects existing /opt/jkef-trading-bot
+# - INSTALL: asks token, wipes target
+# - UPDATE: keeps .env + data
+# - Downloads latest release asset (.tar.gz) from jkef80/jkef-bot-updates
+#   using GitHub API Asset-ID endpoint (reliable binary download)
+# - Extracts and runs inner install.sh from the release tarball
+# ------------------------------------------------------------
+
 REPO_DEFAULT="jkef80/jkef-bot-updates"
 TARGET_DEFAULT="/opt/jkef-trading-bot"
 WORK_ROOT_DEFAULT="/tmp/jkef-install"
@@ -91,7 +102,7 @@ confirm_install_tty() {
   [[ "$c" == "JA" ]]
 }
 
-# ---- Robust GitHub request (captures HTTP status + body) ----
+# ---- Robust GitHub request: captures HTTP status + body ----
 gh_api_get() {
   local url="$1"
   local token="$2"
@@ -106,45 +117,57 @@ gh_api_get() {
 
 body_is_json_object() {
   local file="$1"
-  # allow leading whitespace/newline, must contain a '{' early
   python3 - <<'PY' "$file"
-import sys, re
+import sys
 p=sys.argv[1]
-data=open(p,'rb').read()
-# strip leading whitespace
-s=data.lstrip()
-sys.exit(0 if s.startswith(b'{') else 1)
+data=open(p,'rb').read().lstrip()
+sys.exit(0 if data.startswith(b'{') else 1)
 PY
 }
 
-select_asset_url_from_release_file() {
+select_asset_id_from_release_file() {
   local file="$1"
   python3 - <<'PY' "$file"
 import json,sys
 p=sys.argv[1]
 j=json.load(open(p,'r',encoding='utf-8',errors='replace'))
 assets=j.get("assets") or []
+# Prefer .tar.gz
 for a in assets:
     n=(a.get("name") or "")
-    u=(a.get("browser_download_url") or "")
-    if n.endswith(".tar.gz") and u:
-        print(u); sys.exit(0)
+    if n.endswith(".tar.gz") and a.get("id"):
+        print(a["id"]); sys.exit(0)
+# Fallback: any asset id
 for a in assets:
-    u=(a.get("browser_download_url") or "")
-    if u:
-        print(u); sys.exit(0)
+    if a.get("id"):
+        print(a["id"]); sys.exit(0)
 print("")
 PY
 }
 
-download_asset() {
-  local url="$1"
-  local token="$2"
-  local out="$3"
+download_asset_by_id() {
+  local repo="$1"
+  local asset_id="$2"
+  local token="$3"
+  local out="$4"
+
+  local url="${API_BASE}/repos/${repo}/releases/assets/${asset_id}"
   local hdr=()
   hdr+=(-H "Accept: application/octet-stream")
   [[ -n "$token" ]] && hdr+=(-H "Authorization: token ${token}")
+
   curl -sS -L "${hdr[@]}" -o "$out" "$url"
+}
+
+is_gzip_file() {
+  local f="$1"
+  python3 - <<'PY' "$f"
+import sys
+p=sys.argv[1]
+with open(p,'rb') as fp:
+    b=fp.read(2)
+sys.exit(0 if b == b'\x1f\x8b' else 1)
+PY
 }
 
 # ---------------- MAIN ----------------
@@ -212,31 +235,35 @@ log "Hole latest Release Info ..."
 URL="${API_BASE}/repos/${REPO}/releases/latest"
 HTTP_CODE="$(gh_api_get "$URL" "$TOKEN" "$REL_FILE" || true)"
 
-# Validate response
 if [[ "$HTTP_CODE" != "200" ]]; then
   log ""
   log "GitHub API HTTP Code: $HTTP_CODE"
-  log "Antwort (erste 400 Zeichen):"
-  head -c 400 "$REL_FILE" 2>/dev/null || true
+  log "Antwort (erste 500 Zeichen):"
+  head -c 500 "$REL_FILE" 2>/dev/null || true
   log ""
-  die "Release-Abfrage fehlgeschlagen. (Token falsch? Repo privat? RateLimit? Netzwerk/Proxy?)"
+  die "Release-Abfrage fehlgeschlagen. (Token/Rechte/RateLimit/Netzwerk?)"
 fi
 
 if ! body_is_json_object "$REL_FILE"; then
   log ""
-  log "GitHub API lieferte kein JSON. Antwort (erste 400 Zeichen):"
-  head -c 400 "$REL_FILE" 2>/dev/null || true
+  log "GitHub API lieferte kein JSON. Antwort (erste 500 Zeichen):"
+  head -c 500 "$REL_FILE" 2>/dev/null || true
   log ""
-  die "Keine JSON-Antwort von GitHub erhalten. Vermutlich Proxy/Captive-Portal oder Terminal-Umgebung."
+  die "Keine JSON-Antwort von GitHub erhalten (Proxy/Captive-Portal/Netzwerk?)."
 fi
 
-ASSET_URL="$(select_asset_url_from_release_file "$REL_FILE")"
-[[ -n "$ASSET_URL" ]] || die "Kein Release-Asset gefunden (erwartet .tar.gz im Release)."
+ASSET_ID="$(select_asset_id_from_release_file "$REL_FILE")"
+[[ -n "$ASSET_ID" ]] || die "Kein Release-Asset gefunden (keine Asset-ID)."
 
-log "Downloade Asset ..."
-# If download fails, show a helpful hint
-if ! download_asset "$ASSET_URL" "$TOKEN" "$TAR_PATH"; then
-  die "Download fehlgeschlagen. Token/Rechte pruefen."
+log "Downloade Asset (via GitHub API Asset-ID) ..."
+download_asset_by_id "$REPO" "$ASSET_ID" "$TOKEN" "$TAR_PATH" || die "Download fehlgeschlagen (Token/Rechte?)."
+
+if ! is_gzip_file "$TAR_PATH"; then
+  log ""
+  log "Download ist kein gzip. Erste 300 Zeichen der Datei:"
+  head -c 300 "$TAR_PATH" 2>/dev/null || true
+  log ""
+  die "Asset-Download lieferte keine .tar.gz Datei (Token/Rechte/Asset?)."
 fi
 
 log "Entpacke Release ..."
