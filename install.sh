@@ -1,87 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# JKEF Installer (Bootstrap) - AUTO + MENU (TTY-safe)
-# - Detects existing install in /opt/jkef-trading-bot
-# - If installed: default UPDATE (keeps .env + data)
-# - If not installed: default INSTALL (asks token, creates target)
-# - Menu is optional; supports arrow keys + hotkeys (i/u/e)
-#
-# Usage:
-#   sudo bash install.sh              # auto-detect + interactive menu (if TTY)
-#   sudo bash install.sh --update     # force update
-#   sudo bash install.sh --install    # force install (wipe target)
-#
-# Env overrides:
-#   JKEF_REPO, JKEF_TARGET, JKEF_WORK_ROOT
-#   JKEF_INSTALL_MODE=install|update
-#   JKEF_GH_TOKEN / GH_TOKEN (optional to avoid prompt)
+# ------------------------------------------------------------
+# JKEF Bootstrap Installer (Putty-safe, no arrow-key menus)
+# - Detects if /opt/jkef-trading-bot exists
+# - Menu via plain stdin: u/i/e
+# - UPDATE keeps .env + data
+# - INSTALL asks GitHub token, wipes target, then installs
+# - Downloads latest release asset (.tar.gz) from jkef80/jkef-bot-updates
+# - Extracts and runs inner install.sh from the release tarball
+# ------------------------------------------------------------
 
 REPO_DEFAULT="jkef80/jkef-bot-updates"
 TARGET_DEFAULT="/opt/jkef-trading-bot"
 WORK_ROOT_DEFAULT="/tmp/jkef-install"
+CACHE_DIR_DEFAULT=""  # will be computed from sudo user home
+
 API_BASE="https://api.github.com"
 
-log() { echo "$*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+log() { echo -e "$*"; }
+die() { echo -e "ERROR: $*" >&2; exit 1; }
 
-need_root() { [[ ${EUID:-0} -eq 0 ]] || die "Bitte mit sudo ausfuehren"; }
-
-has_tty() { [[ -r /dev/tty && -w /dev/tty ]]; }
-
-# ncurses/whiptail arrow keys often fail if TERM is dumb/unknown
-fix_term() {
-  if [[ -z "${TERM:-}" || "${TERM}" == "dumb" ]]; then
-    export TERM="xterm"
-  fi
+need_root() {
+  [[ ${EUID:-0} -eq 0 ]] || die "Bitte mit sudo ausfuehren: sudo bash install.sh"
 }
 
 get_run_user() {
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then echo "$SUDO_USER"; else echo "${USER:-root}"; fi
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    echo "$SUDO_USER"
+  else
+    echo "${USER:-root}"
+  fi
 }
 
 get_home_dir() {
-  local u="$1"; local h
+  local u="$1"
+  local h
   h="$(getent passwd "$u" | cut -d: -f6 || true)"
   [[ -n "$h" ]] && echo "$h" || echo "/root"
 }
 
-ensure_whiptail() {
-  command -v whiptail >/dev/null 2>&1 && return 0
-  command -v apt-get >/dev/null 2>&1 || die "whiptail fehlt (kein apt-get zum Installieren vorhanden)"
-  log "Installing whiptail (newt) ..."
-  apt-get update -y >/dev/null
-  apt-get install -y whiptail >/dev/null
-}
-
-wp_menu() {
-  local title="$1"; shift
-  local text="$1"; shift
-  local -a items=("$@")
-  local tty="/dev/tty"
-  has_tty || die "Kein TTY (/dev/tty) - bitte interaktiv ausfuehren"
-
-  # whiptail returns selection on stderr (2>) when using --menu
-  local tmp; tmp="$(mktemp)"
-  # NOTE: HOTKEYS: in whiptail menu you can press first letter of tag
-  whiptail --title "$title" --menu "$text" 16 92 7 "${items[@]}" 2>"$tmp" <"$tty" >"$tty" || true
-  local choice; choice="$(cat "$tmp" 2>/dev/null || true)"
-  rm -f "$tmp"
-  echo "$choice"
-}
-
-wp_yesno() {
-  local title="$1"; shift
-  local text="$1"; shift
-  local tty="/dev/tty"
-  has_tty || die "Kein TTY (/dev/tty)"
-  whiptail --title "$title" --yesno "$text" 12 92 <"$tty" >"$tty" 2>&1
-}
-
-prompt_secret_tty() {
+prompt_secret() {
+  # Reads from /dev/tty so it works even when stdin is piped
   local prompt="$1"
   local tty="/dev/tty"
-  has_tty || die "Kein TTY (/dev/tty)"
+  [[ -r "$tty" && -w "$tty" ]] || die "Kein TTY fuer Token-Eingabe. Setze GH_TOKEN oder JKEF_GH_TOKEN als Env."
   printf "%s" "$prompt" >"$tty"
   stty -echo <"$tty"
   local val=""
@@ -91,47 +54,100 @@ prompt_secret_tty() {
   echo "$val"
 }
 
-select_asset_url() {
+choose_mode_plain() {
+  local installed="$1"   # yes/no
+  local default="u"
+  [[ "$installed" == "no" ]] && default="i"
+
+  log ""
+  log "JKEF Installer (Putty-safe)"
+  log "==========================="
+  if [[ "$installed" == "yes" ]]; then
+    log "Erkannt: INSTALLIERT -> Default: UPDATE (behaelt .env + data)"
+  else
+    log "Erkannt: NICHT installiert -> Default: INSTALL (Token wird abgefragt)"
+  fi
+  log ""
+  log " [u] Update   (behaelt ${TARGET_DEFAULT}/.env und ${TARGET_DEFAULT}/data)"
+  log " [i] Install  (LOESCHT ${TARGET_DEFAULT} inkl. .env + data)"
+  log " [e] Exit"
+  log ""
+  read -r -p "Auswahl (u/i/e) [${default}]: " ans || true
+  ans="${ans:-$default}"
+
+  case "$ans" in
+    u|U) echo "update" ;;
+    i|I) echo "install" ;;
+    e|E) echo "exit" ;;
+    *)   echo "invalid" ;;
+  esac
+}
+
+select_asset_url_from_release_json() {
+  # Prefer an asset ending with .tar.gz (your packaged tarball)
   python3 - <<'PY'
 import json,sys
 j=json.load(sys.stdin)
-assets=j.get('assets') or []
-# Prefer .tar.gz asset (your custom packaged tar)
+assets=j.get("assets") or []
 for a in assets:
-    name=a.get('name','')
-    url=a.get('browser_download_url','')
-    if name.endswith('.tar.gz') and url:
-        print(url); sys.exit(0)
-# Fallback: any asset
+    n=(a.get("name") or "")
+    u=(a.get("browser_download_url") or "")
+    if n.endswith(".tar.gz") and u:
+        print(u)
+        sys.exit(0)
 for a in assets:
-    url=a.get('browser_download_url','')
-    if url:
-        print(url); sys.exit(0)
-print('')
+    u=(a.get("browser_download_url") or "")
+    if u:
+        print(u)
+        sys.exit(0)
+print("")
 PY
 }
 
-# ---------------- main ----------------
+fetch_latest_release_json() {
+  local repo="$1"
+  local token="$2"
+
+  local -a hdr
+  hdr=(-H "Accept: application/vnd.github+json")
+  if [[ -n "$token" ]]; then
+    hdr+=(-H "Authorization: token ${token}")
+  fi
+
+  curl -fsSL "${hdr[@]}" "${API_BASE}/repos/${repo}/releases/latest"
+}
+
+download_asset() {
+  local url="$1"
+  local token="$2"
+  local out="$3"
+
+  local -a hdr
+  hdr=(-H "Accept: application/octet-stream")
+  if [[ -n "$token" ]]; then
+    hdr+=(-H "Authorization: token ${token}")
+  fi
+
+  curl -fsSL -L "${hdr[@]}" "$url" -o "$out"
+}
+
+# -------------------- MAIN --------------------
 need_root
-fix_term
 
 RUN_USER="$(get_run_user)"
 HOME_DIR="$(get_home_dir "$RUN_USER")"
+
 REPO="${JKEF_REPO:-$REPO_DEFAULT}"
 TARGET="${JKEF_TARGET:-$TARGET_DEFAULT}"
 WORK_ROOT="${JKEF_WORK_ROOT:-$WORK_ROOT_DEFAULT}"
-CACHE_DIR="${HOME_DIR}/.cache/jkef"
+CACHE_DIR="${JKEF_CACHE_DIR:-${HOME_DIR}/.cache/jkef}"
 
 mkdir -p "$WORK_ROOT" "$CACHE_DIR"
-chown -R "${RUN_USER}:${RUN_USER}" "$CACHE_DIR" || true
+chown -R "${RUN_USER}:${RUN_USER}" "$CACHE_DIR" >/dev/null 2>&1 || true
 
 INSTALLED="no"
-if [[ -d "$TARGET" ]]; then
-  # if folder exists, treat as installed (even if .env missing)
-  INSTALLED="yes"
-fi
+[[ -d "$TARGET" ]] && INSTALLED="yes"
 
-# parse args / env
 MODE="${JKEF_INSTALL_MODE:-}"
 case "${1:-}" in
   --install) MODE="install" ;;
@@ -140,149 +156,86 @@ case "${1:-}" in
   * ) die "Unbekannter Parameter: ${1}. Nutze: --install | --update" ;;
 esac
 
-# default mode by detection
 if [[ -z "$MODE" ]]; then
-  if [[ "$INSTALLED" == "yes" ]]; then MODE="update"; else MODE="install"; fi
+  MODE="$(choose_mode_plain "$INSTALLED")"
 fi
 
-# Show menu only if TTY and user didn't force mode with args/env
-FORCED="no"
-if [[ -n "${JKEF_INSTALL_MODE:-}" || "${1:-}" == "--install" || "${1:-}" == "--update" ]]; then
-  FORCED="yes"
-fi
+case "$MODE" in
+  install|update) : ;;
+  exit) log "Abbruch."; exit 0 ;;
+  invalid) die "Ungueltige Eingabe. Bitte u/i/e verwenden." ;;
+  *) die "Ungueltiger Mode: $MODE" ;;
+esac
 
-if [[ "$FORCED" == "no" && "$(has_tty && echo yes || echo no)" == "yes" ]]; then
-  ensure_whiptail
+log ""
+log "== Einstellungen =="
+log "Repo   : $REPO"
+log "Target : $TARGET"
+log "Mode   : $MODE"
+log "User   : $RUN_USER"
+log "Cache  : $CACHE_DIR"
+log ""
 
-  local_info="Erkannt: "
-  if [[ "$INSTALLED" == "yes" ]]; then
-    local_info+="INSTALLIERT (Default: UPDATE)"
-  else
-    local_info+="NICHT installiert (Default: INSTALL)"
-  fi
-
-  # Note: You can select with arrow keys OR press i/u/e then Enter
-  CHOICE="$(wp_menu "JKEF Installer" \
-    "Bitte Aktion waehlen\n\n${local_info}\n\nTipps: Pfeil hoch/runter ODER Taste i/u/e, TAB fuer <Ok>, ENTER." \
-    install "Neu installieren (loescht ${TARGET} inkl. .env + data)" \
-    update  "Update (behaelt ${TARGET}/.env und ${TARGET}/data)" \
-    exit    "Abbrechen")"
-
-  case "$CHOICE" in
-    install|update) MODE="$CHOICE" ;;
-    exit|"") log "Abbruch."; exit 0 ;;
-    *) die "Ungueltige Auswahl: $CHOICE" ;;
-  esac
-fi
-
-if [[ "$MODE" == "install" ]]; then
-  if has_tty; then
-    ensure_whiptail || true
-    if command -v whiptail >/dev/null 2>&1; then
-      if ! wp_yesno "JKEF Installer" "WIRKLICH neu installieren?\n\nDas loescht:\n  ${TARGET}\ninkl. .env und data\n\nFortfahren?"; then
-        log "Abbruch."; exit 0
-      fi
-    else
-      log "WARN: whiptail nicht verfuegbar, fahre ohne Rueckfrage fort (INSTALL)."
-    fi
-  fi
-fi
-
-log "== JKEF Installer (Bootstrap) =="
-log "Repo     : $REPO"
-log "User     : $RUN_USER"
-log "Home     : $HOME_DIR"
-log "Target   : $TARGET"
-log "Cache    : $CACHE_DIR"
-log "Mode     : $MODE"
-log "Installed: $INSTALLED"
-echo
-
-# Token handling:
-# - For UPDATE: token optional (if release is public, it might work without)
-# - For INSTALL: token required (as you want "install nur mit KEY")
+# Token: required for INSTALL, optional for UPDATE (but we may ask if GitHub denies without token)
 TOKEN="${JKEF_GH_TOKEN:-${GH_TOKEN:-}}"
-if [[ -z "$TOKEN" ]]; then
-  if [[ "$MODE" == "install" ]]; then
-    has_tty || die "Kein TTY fuer Token-Eingabe. Setze JKEF_GH_TOKEN oder GH_TOKEN als Env."
-    TOKEN="$(prompt_secret_tty "GitHub Token eingeben (Eingabe bleibt unsichtbar) und ENTER: ")"
-    [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
-  else
-    # update: try without token first; if fails, we will ask later
-    TOKEN=""
-  fi
+
+if [[ "$MODE" == "install" && -z "$TOKEN" ]]; then
+  TOKEN="$(prompt_secret "GitHub Token eingeben (unsichtbar) und ENTER: ")"
+  [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
 fi
 
 if [[ "$MODE" == "install" ]]; then
-  log "Wiping target directory: $TARGET"
+  log "WARNUNG: INSTALL loescht komplett: $TARGET (inkl. .env + data)"
+  read -r -p "Wirklich fortfahren? Tippe: JA (sonst Abbruch): " confirm || true
+  [[ "$confirm" == "JA" ]] || { log "Abbruch."; exit 0; }
   rm -rf "$TARGET"
 fi
 
 TAR_PATH="${CACHE_DIR}/jkef-release.tar.gz"
 EXTRACT_DIR="${WORK_ROOT}/release"
-rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
+rm -rf "$EXTRACT_DIR"
+mkdir -p "$EXTRACT_DIR"
 
-fetch_latest_release_json() {
-  local hdr=()
-  if [[ -n "$TOKEN" ]]; then
-    hdr=(-H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github+json")
-  else
-    hdr=(-H "Accept: application/vnd.github+json")
-  fi
-  curl -fsSL "${hdr[@]}" "${API_BASE}/repos/${REPO}/releases/latest"
-}
-
-download_asset() {
-  local url="$1"
-  local hdr=()
-  if [[ -n "$TOKEN" ]]; then
-    hdr=(-H "Authorization: token ${TOKEN}" -H "Accept: application/octet-stream")
-  else
-    hdr=(-H "Accept: application/octet-stream")
-  fi
-  curl -fsSL -L "${hdr[@]}" "$url" -o "$TAR_PATH"
-}
-
-log "Fetching latest release ..."
+log "Hole latest Release Info ..."
 set +e
-REL_JSON="$(fetch_latest_release_json)"
+REL_JSON="$(fetch_latest_release_json "$REPO" "$TOKEN")"
 RC=$?
 set -e
+
 if [[ $RC -ne 0 ]]; then
-  # likely needs token
   if [[ -z "$TOKEN" ]]; then
-    has_tty || die "Release-Abfrage fehlgeschlagen. Kein TTY fuer Token. Setze GH_TOKEN."
-    TOKEN="$(prompt_secret_tty "GitHub Token benoetigt. Bitte eingeben und ENTER: ")"
+    log "Release-Abfrage ohne Token fehlgeschlagen. Token wird benoetigt."
+    TOKEN="$(prompt_secret "GitHub Token eingeben (unsichtbar) und ENTER: ")"
     [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
-    REL_JSON="$(fetch_latest_release_json)"
+    REL_JSON="$(fetch_latest_release_json "$REPO" "$TOKEN")"
   else
-    die "Release-Abfrage fehlgeschlagen (Token evtl. falsch?)."
+    die "Release-Abfrage fehlgeschlagen (Token falsch oder keine Rechte?)."
   fi
 fi
 
-ASSET_URL="$(printf "%s" "$REL_JSON" | select_asset_url)"
-[[ -n "$ASSET_URL" ]] || die "Kein Release-Asset (.tar.gz) gefunden."
+ASSET_URL="$(printf "%s" "$REL_JSON" | select_asset_url_from_release_json)"
+[[ -n "$ASSET_URL" ]] || die "Kein Release-Asset gefunden (erwartet .tar.gz im Release)."
 
-log "Downloading release asset ..."
+log "Downloade Asset ..."
 set +e
-download_asset "$ASSET_URL"
+download_asset "$ASSET_URL" "$TOKEN" "$TAR_PATH"
 RC=$?
 set -e
 if [[ $RC -ne 0 ]]; then
-  # try token prompt if not set
   if [[ -z "$TOKEN" ]]; then
-    has_tty || die "Download fehlgeschlagen. Kein TTY fuer Token. Setze GH_TOKEN."
-    TOKEN="$(prompt_secret_tty "Download braucht Token. Bitte eingeben und ENTER: ")"
+    log "Download ohne Token fehlgeschlagen. Token wird benoetigt."
+    TOKEN="$(prompt_secret "GitHub Token eingeben (unsichtbar) und ENTER: ")"
     [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
-    download_asset "$ASSET_URL"
+    download_asset "$ASSET_URL" "$TOKEN" "$TAR_PATH"
   else
-    die "Download fehlgeschlagen (Token evtl. falsch?)."
+    die "Download fehlgeschlagen (Token falsch oder keine Rechte?)."
   fi
 fi
 
-log "Extracting ..."
+log "Entpacke Release ..."
 tar -xzf "$TAR_PATH" -C "$EXTRACT_DIR"
 
+# GitHub tarballs usually have a single top-level folder.
 INNER="$EXTRACT_DIR"
 shopt -s nullglob
 entries=("$EXTRACT_DIR"/*)
@@ -291,18 +244,19 @@ if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
   INNER="${entries[0]}"
 fi
 
-[[ -f "${INNER}/install.sh" ]] || die "install.sh nicht im Release gefunden."
+[[ -f "${INNER}/install.sh" ]] || die "Im Release fehlt install.sh (inner installer)."
 chmod +x "${INNER}/install.sh" || true
 
+# Pass mode + token to inner installer
+export JKEF_INSTALL_MODE="$MODE"
 export JKEF_GH_TOKEN="$TOKEN"
 export GH_TOKEN="$TOKEN"
-export JKEF_INSTALL_MODE="$MODE"
+export JKEF_TARGET="$TARGET"
 
-# ensure we run inner installer interactive if possible
-if has_tty; then
-  bash "${INNER}/install.sh" < /dev/tty
-else
-  bash "${INNER}/install.sh"
-fi
+log ""
+log "Starte inneren Installer: ${INNER}/install.sh"
+log "-------------------------------------------"
+bash "${INNER}/install.sh"
 
-log "Done."
+log ""
+log "Fertig."
