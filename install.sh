@@ -11,9 +11,7 @@ log() { echo "$*"; }
 
 need_root() { [[ ${EUID:-0} -eq 0 ]] || die "Bitte mit sudo ausfuehren: sudo bash install.sh"; }
 
-tty_path() {
-  [[ -r /dev/tty && -w /dev/tty ]] && echo "/dev/tty" || echo ""
-}
+tty_path() { [[ -r /dev/tty && -w /dev/tty ]] && echo "/dev/tty" || echo ""; }
 
 get_run_user() {
   if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then echo "$SUDO_USER"; else echo "${USER:-root}"; fi
@@ -26,7 +24,6 @@ get_home_dir() {
   [[ -n "$h" ]] && echo "$h" || echo "/root"
 }
 
-# Reads from /dev/tty and hides input
 prompt_secret_tty() {
   local prompt="$1"
   local tty; tty="$(tty_path)"
@@ -40,9 +37,6 @@ prompt_secret_tty() {
   echo "$val"
 }
 
-# Putty-safe menu:
-# - prints ALL UI to /dev/tty
-# - echoes ONLY selection to stdout
 choose_mode_plain() {
   local installed="$1"   # yes/no
   local default="u"
@@ -97,10 +91,38 @@ confirm_install_tty() {
   [[ "$c" == "JA" ]]
 }
 
-select_asset_url_from_release_json() {
-  python3 - <<'PY'
+# ---- Robust GitHub request (captures HTTP status + body) ----
+gh_api_get() {
+  local url="$1"
+  local token="$2"
+  local out="$3"
+  local hdr=()
+  hdr+=(-H "Accept: application/vnd.github+json")
+  [[ -n "$token" ]] && hdr+=(-H "Authorization: token ${token}")
+
+  # write body to $out, print HTTP code to stdout
+  curl -sS -L "${hdr[@]}" -o "$out" -w "%{http_code}" "$url"
+}
+
+body_is_json_object() {
+  local file="$1"
+  # allow leading whitespace/newline, must contain a '{' early
+  python3 - <<'PY' "$file"
+import sys, re
+p=sys.argv[1]
+data=open(p,'rb').read()
+# strip leading whitespace
+s=data.lstrip()
+sys.exit(0 if s.startswith(b'{') else 1)
+PY
+}
+
+select_asset_url_from_release_file() {
+  local file="$1"
+  python3 - <<'PY' "$file"
 import json,sys
-j=json.load(sys.stdin)
+p=sys.argv[1]
+j=json.load(open(p,'r',encoding='utf-8',errors='replace'))
 assets=j.get("assets") or []
 for a in assets:
     n=(a.get("name") or "")
@@ -115,23 +137,14 @@ print("")
 PY
 }
 
-fetch_latest_release_json() {
-  local repo="$1"
-  local token="$2"
-  local -a hdr
-  hdr=(-H "Accept: application/vnd.github+json")
-  [[ -n "$token" ]] && hdr+=(-H "Authorization: token ${token}")
-  curl -fsSL "${hdr[@]}" "${API_BASE}/repos/${repo}/releases/latest"
-}
-
 download_asset() {
   local url="$1"
   local token="$2"
   local out="$3"
-  local -a hdr
-  hdr=(-H "Accept: application/octet-stream")
+  local hdr=()
+  hdr+=(-H "Accept: application/octet-stream")
   [[ -n "$token" ]] && hdr+=(-H "Authorization: token ${token}")
-  curl -fsSL -L "${hdr[@]}" "$url" -o "$out"
+  curl -sS -L "${hdr[@]}" -o "$out" "$url"
 }
 
 # ---------------- MAIN ----------------
@@ -188,44 +201,42 @@ if [[ "$MODE" == "install" ]]; then
   rm -rf "$TARGET"
 fi
 
+REL_FILE="${WORK_ROOT}/latest_release.json"
 TAR_PATH="${CACHE_DIR}/jkef-release.tar.gz"
 EXTRACT_DIR="${WORK_ROOT}/release"
-rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
+
+rm -rf "$EXTRACT_DIR"
+mkdir -p "$EXTRACT_DIR"
 
 log "Hole latest Release Info ..."
-set +e
-REL_JSON="$(fetch_latest_release_json "$REPO" "$TOKEN")"
-RC=$?
-set -e
+URL="${API_BASE}/repos/${REPO}/releases/latest"
+HTTP_CODE="$(gh_api_get "$URL" "$TOKEN" "$REL_FILE" || true)"
 
-if [[ $RC -ne 0 ]]; then
-  if [[ -z "$TOKEN" ]]; then
-    log "Release-Abfrage ohne Token fehlgeschlagen. Token wird benoetigt."
-    TOKEN="$(prompt_secret_tty "GitHub Token eingeben (unsichtbar) und ENTER: ")"
-    [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
-    REL_JSON="$(fetch_latest_release_json "$REPO" "$TOKEN")"
-  else
-    die "Release-Abfrage fehlgeschlagen (Token falsch oder keine Rechte?)."
-  fi
+# Validate response
+if [[ "$HTTP_CODE" != "200" ]]; then
+  log ""
+  log "GitHub API HTTP Code: $HTTP_CODE"
+  log "Antwort (erste 400 Zeichen):"
+  head -c 400 "$REL_FILE" 2>/dev/null || true
+  log ""
+  die "Release-Abfrage fehlgeschlagen. (Token falsch? Repo privat? RateLimit? Netzwerk/Proxy?)"
 fi
 
-ASSET_URL="$(printf "%s" "$REL_JSON" | select_asset_url_from_release_json)"
+if ! body_is_json_object "$REL_FILE"; then
+  log ""
+  log "GitHub API lieferte kein JSON. Antwort (erste 400 Zeichen):"
+  head -c 400 "$REL_FILE" 2>/dev/null || true
+  log ""
+  die "Keine JSON-Antwort von GitHub erhalten. Vermutlich Proxy/Captive-Portal oder Terminal-Umgebung."
+fi
+
+ASSET_URL="$(select_asset_url_from_release_file "$REL_FILE")"
 [[ -n "$ASSET_URL" ]] || die "Kein Release-Asset gefunden (erwartet .tar.gz im Release)."
 
 log "Downloade Asset ..."
-set +e
-download_asset "$ASSET_URL" "$TOKEN" "$TAR_PATH"
-RC=$?
-set -e
-if [[ $RC -ne 0 ]]; then
-  if [[ -z "$TOKEN" ]]; then
-    log "Download ohne Token fehlgeschlagen. Token wird benoetigt."
-    TOKEN="$(prompt_secret_tty "GitHub Token eingeben (unsichtbar) und ENTER: ")"
-    [[ -n "$TOKEN" ]] || die "Kein Token eingegeben."
-    download_asset "$ASSET_URL" "$TOKEN" "$TAR_PATH"
-  else
-    die "Download fehlgeschlagen (Token falsch oder keine Rechte?)."
-  fi
+# If download fails, show a helpful hint
+if ! download_asset "$ASSET_URL" "$TOKEN" "$TAR_PATH"; then
+  die "Download fehlgeschlagen. Token/Rechte pruefen."
 fi
 
 log "Entpacke Release ..."
